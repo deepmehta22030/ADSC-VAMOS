@@ -1132,3 +1132,464 @@ app.delete('/api/workers/:id', auth, (req, res) => {
 
 // Notifications
 app.get('/api/notifications', auth, (req, res) => {
+  const data = db();
+
+  res.json({
+    notifications: data.notifications
+      .filter(n => !n.userId || n.userId === req.user.id)
+      .slice(0, 20)
+  });
+});
+
+// Attendance
+app.get('/api/attendance', auth, (req, res) => {
+  const data = db();
+
+  const tokens = data.tokens
+    .filter(t =>
+      t.userId === req.user.id &&
+      ['waiting', 'serving'].includes(t.status)
+    )
+    .map(t => ({
+      id: t.id,
+      token: t.token,
+      service: t.service,
+      officeId: t.officeId,
+      status: t.status,
+      attendanceStatus: t.attendanceStatus || 'Needs confirmation',
+      confirmedAt: t.confirmedAt || null,
+      arrivalNote: t.arrivalNote || ''
+    }));
+
+  res.json({ tokens, gracePeriodMinutes: 10 });
+});
+
+app.post('/api/attendance/:id', auth, (req, res) => {
+  const allowed = ['Coming', 'Running late', 'Cancelled'];
+  const status = req.body?.status;
+
+  if (!allowed.includes(status)) {
+    return res.status(400).json({
+      error: 'Choose Coming, Running late, or Cancelled'
+    });
+  }
+
+  const data = db();
+  const token = data.tokens.find(t =>
+    t.id === req.params.id && t.userId === req.user.id
+  );
+
+  if (!token) {
+    return res.status(404).json({
+      error: 'Your active token was not found'
+    });
+  }
+
+  if (!['waiting', 'serving'].includes(token.status)) {
+    return res.status(409).json({
+      error: 'Attendance can only be updated for an active token'
+    });
+  }
+
+  token.attendanceStatus = status;
+  token.confirmedAt = Date.now();
+  token.arrivalNote = String(req.body?.note || '').slice(0, 160);
+
+  if (status === 'Cancelled') {
+    token.status = 'cancelled';
+
+    data.slotWaitlist = data.slotWaitlist || [];
+    data.slotWaitlist.push({
+      id: crypto.randomUUID(),
+      userId: req.user.id,
+      name: req.user.name,
+      officeId: token.officeId,
+      service: token.service,
+      createdAt: Date.now(),
+      status: 'waiting'
+    });
+
+    data.recoveredSlots = data.recoveredSlots || [];
+    data.recoveredSlots.push({
+      id: crypto.randomUUID(),
+      officeId: token.officeId,
+      service: token.service,
+      sourceTokenId: token.id,
+      createdAt: Date.now(),
+      claimed: false
+    });
+  }
+
+  data.notifications.unshift({
+    id: crypto.randomUUID(),
+    userId: req.user.id,
+    title: 'Attendance updated',
+    message: status === 'Cancelled'
+      ? 'Appointment cancelled and slot released to recovery.'
+      : status === 'Running late'
+        ? 'Late arrival noted. Please contact the office if you exceed its grace period.'
+        : 'Attendance confirmed. We look forward to seeing you.',
+    time: Date.now(),
+    read: false
+  });
+
+  save(data);
+
+  res.json({
+    ok: true,
+    status,
+    token: token.token,
+    message: status === 'Cancelled'
+      ? 'Appointment cancelled and slot added to recovery.'
+      : status === 'Running late'
+        ? 'Marked as running late. Office grace-period policy applies.'
+        : 'Attendance confirmed.'
+  });
+});
+
+// Slot recovery
+app.post('/api/tokens/:id/cancel', auth, (req, res) => {
+  const data = db();
+
+  const token = data.tokens.find(t =>
+    t.id === req.params.id && t.userId === req.user.id
+  );
+
+  if (!token) {
+    return res.status(404).json({ error: 'Your token was not found' });
+  }
+
+  if (token.status !== 'waiting') {
+    return res.status(409).json({
+      error: 'Only waiting tokens can be cancelled'
+    });
+  }
+
+  token.status = 'cancelled';
+
+  data.slotWaitlist = data.slotWaitlist || [];
+  const entry = {
+    id: crypto.randomUUID(),
+    userId: req.user.id,
+    name: req.user.name,
+    officeId: token.officeId,
+    service: token.service,
+    createdAt: Date.now(),
+    status: 'waiting'
+  };
+
+  data.slotWaitlist.push(entry);
+
+  data.recoveredSlots = data.recoveredSlots || [];
+  data.recoveredSlots.push({
+    id: crypto.randomUUID(),
+    officeId: token.officeId,
+    service: token.service,
+    sourceTokenId: token.id,
+    createdAt: Date.now(),
+    claimed: false
+  });
+
+  save(data);
+
+  res.json({
+    message: 'Token cancelled. You have been added to the standby list for a recovered slot.',
+    waitlistEntry: entry
+  });
+});
+
+app.get('/api/slots/standby', auth, (req, res) => {
+  const data = db();
+
+  res.json({
+    entries: (data.slotWaitlist || []).filter(
+      x => x.userId === req.user.id && x.status === 'waiting'
+    )
+  });
+});
+
+app.post('/api/slots/claim', auth, (req, res) => {
+  const data = db();
+
+  const entry = (data.slotWaitlist || []).find(x =>
+    x.id === req.body?.entryId &&
+    x.userId === req.user.id &&
+    x.status === 'waiting'
+  );
+
+  if (!entry) {
+    return res.status(404).json({
+      error: 'Standby request not found'
+    });
+  }
+
+  data.recoveredSlots = data.recoveredSlots || [];
+
+  const slot = data.recoveredSlots.find(x =>
+    !x.claimed &&
+    x.officeId === entry.officeId &&
+    x.service === entry.service
+  );
+
+  if (!slot) {
+    return res.status(409).json({
+      error: 'No recovered slot is available for this service yet. Please try again shortly.'
+    });
+  }
+
+  slot.claimed = true;
+  entry.status = 'claimed';
+
+  const made = makeToken(
+    data,
+    { id: req.user.id, name: req.user.name },
+    {
+      officeId: entry.officeId,
+      service: entry.service,
+      name: req.user.name,
+      paymentMethod: 'office',
+      paymentStatus: 'pay_at_office'
+    }
+  );
+
+  save(data);
+
+  res.json({
+    token: made.token,
+    qrPayload: made.qrPayload,
+    message: 'Recovered slot claimed. Pay at the office.'
+  });
+});
+
+// Grievances
+app.get('/api/grievances', auth, (req, res) => {
+  const data = db();
+  const all = data.grievances || [];
+
+  res.json({
+    grievances: all
+      .filter(g => req.user.role === 'admin' || g.userId === req.user.id)
+      .sort((a, b) => b.createdAt - a.createdAt)
+  });
+});
+
+app.post('/api/grievances', auth, (req, res) => {
+  const { category, subject, description } = req.body || {};
+
+  if (!category || !subject?.trim() || !description?.trim()) {
+    return res.status(400).json({
+      error: 'Category, subject and description are required'
+    });
+  }
+
+  if (subject.length > 120 || description.length > 1500) {
+    return res.status(400).json({
+      error: 'Subject or description is too long'
+    });
+  }
+
+  const data = db();
+  data.grievances = data.grievances || [];
+
+  const grievance = {
+    id: crypto.randomUUID(),
+    reference: 'GR-' + String(Date.now()).slice(-7),
+    userId: req.user.id,
+    userName: req.user.name,
+    category,
+    subject: subject.trim(),
+    description: description.trim(),
+    status: 'Submitted',
+    createdAt: Date.now(),
+    updates: []
+  };
+
+  data.grievances.push(grievance);
+  save(data);
+
+  res.status(201).json({ grievance });
+});
+
+app.patch('/api/grievances/:id', auth, (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({
+      error: 'Officer access required'
+    });
+  }
+
+  const data = db();
+
+  const grievance = (data.grievances || []).find(
+    g => g.id === req.params.id
+  );
+
+  if (!grievance) {
+    return res.status(404).json({ error: 'Grievance not found' });
+  }
+
+  const allowed = ['Submitted', 'In Review', 'Resolved', 'Rejected'];
+
+  if (!allowed.includes(req.body?.status)) {
+    return res.status(400).json({
+      error: 'Invalid grievance status'
+    });
+  }
+
+  grievance.status = req.body.status;
+
+  grievance.updates.push({
+    status: grievance.status,
+    note: String(req.body.note || 'Status updated by officer').slice(0, 300),
+    time: Date.now()
+  });
+
+  save(data);
+
+  res.json({ grievance });
+});
+
+// Queue forecast
+app.get('/api/forecast/:officeId', auth, (req, res) => {
+  const data = db();
+  const officeId = req.params.officeId;
+
+  const all = data.tokens.filter(t => t.officeId === officeId);
+
+  const active = all.filter(t =>
+    ['waiting', 'serving', 'missing'].includes(t.status)
+  );
+
+  const workers = data.workers.filter(w => w.on).length;
+  const waiting = active.filter(t => t.status === 'waiting').length;
+
+  const recentDone = all
+    .filter(t => t.status === 'done' && t.completedAt)
+    .slice(-20);
+
+  const avgService = recentDone.length
+    ? Math.max(
+        4,
+        Math.round(
+          recentDone.reduce((n, t) => n + (t.serviceMinutes || 7), 0) /
+          recentDone.length
+        )
+      )
+    : 7;
+
+  const base = Math.max(
+    5,
+    Math.ceil(waiting / Math.max(1, workers) * avgService)
+  );
+
+  const load = Math.min(
+    100,
+    Math.round(waiting / Math.max(1, workers * 4) * 100)
+  );
+
+  const band = base <= 10 ? 'Low' : base <= 25 ? 'Moderate' : 'High';
+
+  const hours = [
+    { label: '10–11 AM', load: 28 },
+    { label: '11 AM–12 PM', load: 52 },
+    { label: '12–1 PM', load: 84 },
+    { label: '1–2 PM', load: 67 },
+    { label: '2–3 PM', load: 42 },
+    { label: '3–4 PM', load: 36 },
+    { label: '4–5 PM', load: 24 }
+  ];
+
+  res.json({
+    officeId,
+    generatedAt: Date.now(),
+    waiting,
+    activeWorkers: workers,
+    averageServiceMinutes: avgService,
+    estimatedWaitMinutes: base + recessMinutesRemaining(),
+    load,
+    loadBand: band,
+    confidence: recentDone.length >= 5
+      ? 'Improving with completed-visit data'
+      : 'Demo estimate; confidence improves as completed visits are recorded',
+    busyPeriods: hours.filter(x => x.load >= 60),
+    hourly: hours,
+    method: 'Queue length ÷ active counters × average service duration, plus office recess delay.'
+  });
+});
+
+// Analytics
+app.get('/api/analytics', auth, (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({
+      error: 'Officer access required'
+    });
+  }
+
+  const data = db();
+
+  const completed = data.tokens.filter(t => t.status === 'done').length;
+  const waiting = data.tokens.filter(t => t.status === 'waiting').length;
+  const served = data.tokens.filter(t =>
+    ['done', 'serving'].includes(t.status)
+  ).length;
+
+  res.json({
+    kpis: {
+      todayTokens: data.tokens.length,
+      waiting,
+      completed,
+      activeWorkers: data.workers.filter(w => w.on).length,
+      serviceRate: Math.min(
+        100,
+        Math.round(served / Math.max(1, data.tokens.length) * 100)
+      )
+    },
+    hourly: [
+      { hour: '10 AM', tokens: 4 },
+      { hour: '11 AM', tokens: 7 },
+      { hour: '12 PM', tokens: 9 },
+      { hour: '1 PM', tokens: 6 },
+      { hour: '2 PM', tokens: 3 }
+    ],
+    services: [
+      { name: 'Aadhaar', value: 32 },
+      { name: 'PAN', value: 24 },
+      { name: 'Birth', value: 18 },
+      { name: 'Property', value: 14 },
+      { name: 'Certificates', value: 12 }
+    ]
+  });
+});
+
+// Test notification
+app.post('/api/notifications/test', auth, (req, res) => {
+  const data = db();
+
+  data.notifications.unshift({
+    id: crypto.randomUUID(),
+    userId: req.user.id,
+    title: 'QueueLess smart reminder',
+    message: req.body?.message ||
+      'Your turn is approaching. Please start travelling to the office.',
+    time: Date.now(),
+    read: false
+  });
+
+  save(data);
+
+  res.json({ ok: true });
+});
+
+// Serve frontend static files when available
+app.use(express.static(path.join(__dirname, '..', 'dist')));
+
+// Vercel imports this Express app as a serverless function.
+// Run a persistent listener only during local development.
+if (!process.env.VERCEL) {
+  app.listen(process.env.PORT || 4000, () => {
+    console.log(
+      `QueueLess API running on http://localhost:${process.env.PORT || 4000}`
+    );
+  });
+}
+
+export default app;
