@@ -146,7 +146,18 @@ const initial = {
   notifications: []
 };
 
+
+let memoryData = null;
+
 function db() {
+  if (process.env.VERCEL) {
+    if (!memoryData) {
+      memoryData = JSON.parse(JSON.stringify(initial));
+    }
+
+    return memoryData;
+  }
+
   if (!fs.existsSync(DATA)) {
     fs.writeFileSync(DATA, JSON.stringify(initial, null, 2));
   }
@@ -155,6 +166,11 @@ function db() {
 }
 
 function save(data) {
+  if (process.env.VERCEL) {
+    memoryData = data;
+    return;
+  }
+
   fs.writeFileSync(DATA, JSON.stringify(data, null, 2));
 }
 
